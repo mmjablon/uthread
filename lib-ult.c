@@ -28,14 +28,29 @@ struct thread_info{
 };
 
 //declare the queue functions
+void initialize_thread_info(struct thread_info *th, int pri_num);
 void insert(struct thread_info *th);
-void printQueue();
+struct thread_info* pop();
+void print_queue();
+void queue_to_deallocate(struct thread_info *th);
 void deallocate();
 
 struct thread_info *head=NULL, *tail=NULL;
 int num_kernel_threads=0;
-struct thread_info *toDeallocate=NULL;
+struct thread_info *to_deallocate=NULL;
 
+//allocates memory for all the thread info objects
+void initialize_thread_info(struct thread_info *th, int pri_num){
+	th->next=NULL;
+	th->context = (ucontext_t*) malloc(sizeof(ucontext_t));
+	getcontext(th->context);
+	th->context->uc_stack.ss_sp=malloc(16384);
+	th->context->uc_stack.ss_size=16384;
+    th->pri_num=pri_num;
+}
+
+//inserts a thread info struct into the queue ordered by priority number
+//from highest to lowerst priority (lower int = higher priority)
 void insert(struct thread_info *th){
 	if(head!=NULL && head->pri_num <= th->pri_num){
         struct thread_info *current_node = head;
@@ -55,11 +70,25 @@ void insert(struct thread_info *th){
     
 }
 
+//removes the first item in the thread queue
+struct thread_info* pop(){
+    struct thread_info *th = head;
+    head=head->next;
+    if(head==NULL) tail=NULL;
+    return th;
+}
+
+void queue_to_deallocate(struct thread_info *th){
+    th->next = to_deallocate;
+    to_deallocate = th;
+}
+
+//frees all thread info structs in the to deallocate queue
 void deallocate(){
     struct thread_info *current_node;
-    while(toDeallocate!= NULL){
-        current_node=toDeallocate;
-        toDeallocate=current_node->next;
+    while(to_deallocate!= NULL){
+        current_node=to_deallocate;
+        to_deallocate=current_node->next;
 
         free(current_node->context->uc_stack.ss_sp);
         free(current_node->context);
@@ -68,7 +97,7 @@ void deallocate(){
 }
 
 //a function to print the queue for debugging purposes
-void printQueue(){
+void print_queue(){
 	struct thread_info *th = head;
 	while(th != NULL){
 		printf("%i, ", th->pri_num);
@@ -95,7 +124,6 @@ int uthread_create(void func(), int pri_num);
  by calling clone()) that can be used to use to run the user-level threads created by this library.
  max_num_of_klt should be no less than 1.
  */
-
 void system_init(int max_number_of_klt)
 {
 	if(max_number_of_klt < 1){
@@ -116,7 +144,6 @@ void system_init(int max_number_of_klt)
 //code run by a kernel thread
 int kernel_thread(void *arg)
 {
-	struct thread_info *th;
 	ucontext_t *context;
     
 	//fetch a user thread from the queue
@@ -131,18 +158,14 @@ int kernel_thread(void *arg)
 		num_kernel_threads--;
 		exit(EXIT_SUCCESS);
 	}else{
-		th = head;
-		context=head->context;
-		head=head->next;
-        if(head==NULL) tail=NULL;
+		struct thread_info *th = pop();
         
         //add the context object to the queue to be destoryed
-        th->next = toDeallocate;
-        toDeallocate = th;
+        queue_to_deallocate(th);
 		sem_post(&queue_lock);
         
 		//run the user thread
-		setcontext(context);
+		setcontext(th->context);
 	}
 }
 
@@ -159,15 +182,8 @@ int uthread_create(void func(), int pri_num)
 	}
     
 	//construct a thread record
-	struct thread_info *th;
-	th=(struct thread_info *)malloc(sizeof(struct thread_info));
-	th->next=NULL;
-	th->pri_num=pri_num;
-    
-	th->context = (ucontext_t*) malloc(sizeof(ucontext_t));
-	getcontext(th->context);
-	th->context->uc_stack.ss_sp=malloc(16384);
-	th->context->uc_stack.ss_size=16384;
+	struct thread_info *th = (struct thread_info *)malloc(sizeof(struct thread_info));
+    initialize_thread_info(th, pri_num);
 	makecontext(th->context, func, 0);
     
 	//add the thread record into the queue
@@ -206,35 +222,22 @@ int uthread_yield(int pri_num){
 	if(head==NULL || head->pri_num > pri_num){
 		//do nothing, next thread in queue so keep running
 	}else{
-		//construct a new thread record
-		struct thread_info *th;
-		th=(struct thread_info *)malloc(sizeof(struct thread_info));
-		th->next=NULL;
-		th->pri_num=pri_num;
-        
-		th->context = (ucontext_t*) malloc(sizeof(ucontext_t));
-		getcontext(th->context);
-		th->context->uc_stack.ss_sp=malloc(16384);
-		th->context->uc_stack.ss_size=16384;
+		//construct a new thread record to store the thread we're yielding
+		struct thread_info *yielded = (struct thread_info *)malloc(sizeof(struct thread_info));
+		initialize_thread_info(yielded, pri_num);
 		
 		//place thread in the queue
 		sem_wait(&queue_lock);
-		insert(th);
+		insert(yielded);
 		
-		struct thread_info *next;
-		ucontext_t *context;
-		//fetch a user thread from the queue
-		next=head;
-		context=head->context;
-		head=head->next;
-		if(head==NULL) tail=NULL;
-        
-        next->next = toDeallocate;
-        toDeallocate = next;
+        //grab the next thread to run
+		struct thread_info *next = pop();
+
+        queue_to_deallocate(next);
         
 		sem_post(&queue_lock);
 		
-		success = swapcontext(th->context, context);
+		success = swapcontext(yielded->context, next->context);
 	}
 	return success;
 }
@@ -260,20 +263,14 @@ void uthread_exit(){
         deallocate();
 		exit(EXIT_SUCCESS);
 	}else{
-		ucontext_t *context;
-		struct thread_info *th;
+        //fetch a user thread from the queue
+		struct thread_info *th = pop();
         
-		//fetch a user thread from the queue
-		context=head->context;
-		th=head;
-		head=head->next;
-		if(head==NULL) tail=NULL;
 		deallocate();
         //add the context object to the queue to be destoryed
-        th->next = toDeallocate;
-        toDeallocate = th;
+        queue_to_deallocate(th);
 		sem_post(&queue_lock);
         
-		setcontext(context);
+		setcontext(th->context);
 	}
 }
